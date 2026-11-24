@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Estación Ambiental Bluetooth</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a; --card: #1e293b; --text: #f8fafc;
+      --muted: #94a3b8; --accent: #38bdf8; --ok: #22c55e; --danger: #ef4444;
+    }
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; padding: 24px; background: var(--bg); color: var(--text); }
+    .container { max-width: 1100px; margin: 0 auto; }
+    header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 1.5rem; }
+    .controls { display: flex; gap: 10px; flex-wrap: wrap; }
+    button { border: none; padding: 10px 16px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+    .btn-connect { background: var(--accent); color: #0f172a; }
+    .btn-disconnect { background: var(--danger); color: white; display: none; }
+    .btn-export { background: var(--ok); color: #0f172a; }
+    .btn-clear { background: #334155; color: var(--text); }
+    .status { font-size: 0.9rem; color: var(--muted); margin-top: 4px; }
+    .debug-bar {
+      background: #020617; border: 1px solid #334155; border-radius: 8px;
+      padding: 10px 14px; margin-bottom: 20px; font-family: monospace;
+      font-size: 0.85rem; color: #38bdf8;
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card { background: var(--card); padding: 20px; border-radius: 12px; border: 1px solid #334155; }
+    .card-label { color: var(--muted); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .card-value { font-size: 2.2rem; font-weight: 700; margin-top: 8px; }
+    .chart-box, .table-box { background: var(--card); padding: 20px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 24px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid #334155; }
+    th { color: var(--muted); }
+    .table-scroll { max-height: 260px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>Estación Ambiental en Vivo</h1>
+        <div id="status" class="status">Desconectado — Haz clic en Conectar HC-05</div>
+      </div>
+      <div class="controls">
+        <button id="btnConnect" class="btn-connect">Conectar HC-05</button>
+        <button id="btnDisconnect" class="btn-disconnect">Desconectar</button>
+        <button id="btnExport" class="btn-export">Descargar CSV</button>
+        <button id="btnClear" class="btn-clear">Limpiar</button>
+      </div>
+    </header>
+
+    <div id="rawDebug" class="debug-bar">Último dato recibido: (esperando señal del Arduino...)</div>
+
+    <div class="grid">
+      <div class="card"><div class="card-label">Temperatura</div><div id="valTemp" class="card-value">-- °C</div></div>
+      <div class="card"><div class="card-label">Humedad</div><div id="valHum" class="card-value">-- %</div></div>
+      <div class="card"><div class="card-label">Luz (TEMT6000)</div><div id="valLuz" class="card-value">-- %</div></div>
+      <div class="card"><div class="card-label">Aire (MQ-135)</div><div id="valAire" class="card-value">--</div></div>
+    </div>
+
+    <div class="chart-box">
+      <canvas id="sensorChart" height="90"></canvas>
+    </div>
+
+    <div class="table-box">
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Hora</th><th>Temp (°C)</th><th>Humedad (%)</th><th>Luz (%)</th><th>Aire (raw)</th></tr>
+          </thead>
+          <tbody id="logBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let port, reader, readableStreamClosed, keepReading = false;
+    const registros = [];
+
+    const ctx = document.getElementById('sensorChart').getContext('2d');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Temp (°C)', data: [], borderColor: '#f97316', tension: 0.3 },
+          { label: 'Humedad (%)', data: [], borderColor: '#38bdf8', tension: 0.3 },
+          { label: 'Luz (%)', data: [], borderColor: '#facc15', tension: 0.3 }
+        ]
+      },
+      options: {
+        animation: false,
+        scales: { x: { ticks: { color: '#94a3b8' } }, y: { ticks: { color: '#94a3b8' } } },
+        plugins: { legend: { labels: { color: '#f8fafc' } } }
+      }
+    });
+
+    function procesarLinea(linea) {
+      const texto = linea.trim();
+      if (!texto) return;
+
+      document.getElementById('rawDebug').textContent = 'Último dato recibido: ' + texto;
+
+      let temp, hum, luz, aire;
+      const partes = texto.split(',');
+      if (partes.length === 4) {
+        [temp, hum, luz, aire] = partes.map(Number);
+      } else {
+        const nums = texto.match(/-?\d+(\.\d+)?/g);
+        if (nums && nums.length >= 4) {
+          [temp, hum, luz, aire] = nums.slice(0, 4).map(Number);
+        } else {
+          return;
+        }
+      }
+
+      if ([temp, hum, luz, aire].some(isNaN)) return;
+
+      const hora = new Date().toLocaleTimeString();
+      document.getElementById('valTemp').textContent = `${temp.toFixed(1)} °C`;
+      document.getElementById('valHum').textContent = `${hum.toFixed(1)} %`;
+      document.getElementById('valLuz').textContent = `${luz.toFixed(0)} %`;
+      document.getElementById('valAire').textContent = aire;
+
+      registros.push({ hora, temp, hum, luz, aire });
+
+      chart.data.labels.push(hora);
+      chart.data.datasets[0].data.push(temp);
+      chart.data.datasets[1].data.push(hum);
+      chart.data.datasets[2].data.push(luz);
+      if (chart.data.labels.length > 25) {
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(d => d.data.shift());
+      }
+      chart.update();
+
+      const fila = document.createElement('tr');
+      fila.innerHTML = `<td>${hora}</td><td>${temp.toFixed(1)}</td><td>${hum.toFixed(1)}</td><td>${luz.toFixed(0)}</td><td>${aire}</td>`;
+      document.getElementById('logBody').prepend(fila);
+    }
+
+    document.getElementById('btnConnect').addEventListener('click', async () => {
+      if (!('serial' in navigator)) {
+        alert('Usa Google Chrome o Microsoft Edge para conectar por puerto serial.');
+        return;
+      }
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 9600 });
+        keepReading = true;
+        document.getElementById('status').textContent = 'Conectado al HC-05 (9600 baud)';
+        document.getElementById('btnConnect').style.display = 'none';
+        document.getElementById('btnDisconnect').style.display = 'inline-block';
+
+        const decoder = new TextDecoderStream();
+        readableStreamClosed = port.readable.pipeTo(decoder.writable);
+        reader = decoder.readable.getReader();
+
+        let buffer = '';
+        while (keepReading) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += value;
+          const lineas = buffer.split(/\r?\n/);
+          buffer = lineas.pop();
+          lineas.forEach(procesarLinea);
+        }
+      } catch (err) {
+        document.getElementById('status').textContent = 'Error: ' + err.message;
+      }
+    });
+
+    document.getElementById('btnDisconnect').addEventListener('click', async () => {
+      keepReading = false;
+      try {
+        if (reader) await reader.cancel();
+        if (readableStreamClosed) await readableStreamClosed.catch(() => {});
+        if (port) await port.close();
+      } catch (e) {}
+      document.getElementById('status').textContent = 'Desconectado';
+      document.getElementById('btnConnect').style.display = 'inline-block';
+      document.getElementById('btnDisconnect').style.display = 'none';
+    });
+
+    document.getElementById('btnExport').addEventListener('click', () => {
+      if (!registros.length) return alert('Aún no hay datos registrados.');
+      let csv = 'Hora,Temperatura_C,Humedad_%,Luz_%,Aire_raw\n';
+      registros.forEach(r => csv += `${r.hora},${r.temp},${r.hum},${r.luz},${r.aire}\n`);
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `datos_estacion_${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+    });
+
+    document.getElementById('btnClear').addEventListener('click', () => {
+      registros.length = 0;
+      document.getElementById('logBody').innerHTML = '';
+      chart.data.labels = [];
+      chart.data.datasets.forEach(d => d.data = []);
+      chart.update();
+    });
+  </script>
+</body>
+</html>
